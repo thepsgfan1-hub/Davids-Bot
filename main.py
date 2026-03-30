@@ -44,9 +44,9 @@ def save_db(data, key):
 
 def get_stars(count):
     try:
-        return "⭐️" * int(count)
+        return "⭐" * int(count)
     except:
-        return "⭐️"
+        return "⭐"
 
 # --- [3] КЛАВИАТУРЫ ---
 def main_kb(user):
@@ -88,7 +88,7 @@ def roll(m):
                 remains = int(COOLDOWN_TIME - elapsed)
                 mins = remains // 60
                 secs = remains % 60
-                return bot.send_message(m.chat.id, f"⏳ Нужно подождать еще {mins} мин. {secs} сек.", parse_mode="Markdown")
+                return bot.send_message(m.chat.id, f"⏳ Нужно подождать еще **{mins} мин. {secs} сек.**", parse_mode="Markdown")
         
         last_roll[uid] = now
 
@@ -119,14 +119,15 @@ def roll(m):
     status = "🆕 Новая карта!" if is_new else "♻️ Повторка"
     
     caption = (
-        f"⚽️ {won['name']} ({status})\n"
+        f"⚽️ **{won['name']}** ({status})\n"
         f" — — — — — — — — — —\n"
-        f"🎯 Позиция: `{won.get('pos', '—')}`\n"
-        f"📊 Рейтинг: {get_stars(won.get('stars', 1))}\n"
+        f"🎯 **Позиция:** `{won.get('pos', '—')}`\n"
+        f"📊 **Рейтинг:** {get_stars(won.get('stars', 1))}\n"
         f" — — — — — — — — — —\n"
-        f"💠 Очки: +{int(added_pts):,} | Всего: {users[uid]['score']:,}"
+        f"💠 **Очки:** `+{int(added_pts):,}` | Всего: `{users[uid]['score']:,}`"
     )
-  try:
+
+    try:
         bot.send_photo(m.chat.id, won['photo'], caption=caption, parse_mode="Markdown")
     except Exception as e:
         bot.send_message(m.chat.id, f"❌ Ошибка при отправке фото: {e}\n\n{caption}", parse_mode="Markdown")
@@ -136,7 +137,7 @@ def top_players(m):
     users = load_db('users')
     sorted_users = sorted(users.items(), key=lambda x: x[1]['score'], reverse=True)
     
-    text = "🏆 ТОП-10 ИГРОКОВ:**\n\n"
+    text = "🏆 **ТОП-10 ИГРОКОВ:**\n\n"
     for i, (uid, data) in enumerate(sorted_users[:10], 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
         text += f"{medal} @{data['username']} — `{data['score']:,}` очков\n"
@@ -207,7 +208,7 @@ def process_delete(call):
     cards = load_db('cards')
     new_cards = [c for c in cards if c['name'] != name_to_delete]
     save_db(new_cards, 'cards')
-    bot.edit_message_text(f"✅ Карта {name_to_delete}** удалена.", call.message.chat.id, call.message.message_id)
+    bot.edit_message_text(f"✅ Карта **{name_to_delete}** удалена.", call.message.chat.id, call.message.message_id)
 
 @bot.message_handler(func=lambda m: m.text == "➕ Добавить карту")
 def add_start(m):
@@ -224,7 +225,8 @@ def add_step_pos(m, name):
     stars = m.text
     msg = bot.send_message(m.chat.id, f"Введите ПОЗИЦИЮ:")
     bot.register_next_step_handler(msg, add_step_photo, name, stars)
-  def add_step_photo(m, name, stars):
+
+def add_step_photo(m, name, stars):
     pos = m.text
     msg = bot.send_message(m.chat.id, f"Отправьте ФОТО:")
     bot.register_next_step_handler(msg, add_final, name, stars, pos)
@@ -246,6 +248,6 @@ def add_final(m, name, stars, pos):
 def back(m):
     bot.send_message(m.chat.id, "Главное меню:", reply_markup=main_kb(m.from_user))
 
-if name == 'main':
+if __name__ == '__main__':
     print("Бот запущен и готов к работе!")
     bot.infinity_polling()
