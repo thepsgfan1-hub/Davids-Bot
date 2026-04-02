@@ -6,8 +6,8 @@ import json
 import os
 
 # --- [1] КОНФИГУРАЦИЯ ---
-TOKEN = "8316043913:AAFJFjGapMK62ktJD3LhhPphceJ1BBi_P4A"
-ADMINS = ["verybigsun", "Nazikrrk"] 
+TOKEN = "8681485490:AAHmWVJrzZ1O5R92HcXmG1QFdcE-Q95v8oM
+ADMINS = ["verybigsun"] 
 bot = telebot.TeleBot(TOKEN)
 
 # КД в секундах (3600 = 1 час)
