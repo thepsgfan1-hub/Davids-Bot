@@ -1,413 +1,415 @@
-import telebot
-from telebot import types
-import random
-import time
 import json
-import os
+import logging
+import uuid
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 
-# --- [1] КОНФИГУРАЦИЯ ---
-TOKEN = "8681485490:AAHmWVJrzZ1O5R92HcXmG1QFdcE-Q95v8oM"
-ADMINS = ["verybigsun"] 
-bot = telebot.TeleBot(TOKEN)
+from telegram import Update, ReplyKeyboardRemove
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ConversationHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-# КД в секундах (3600 = 1 час)
-COOLDOWN_TIME = 3600 
+# ==================== НАСТРОЙКИ ====================
+BOT_TOKEN = "8681485490:AAHmWVJrzZ1O5R92HcXmG1QFdcE-Q95v8oM"
+DATA_FILE = "data.json"
+MAX_PLAYERS = 7
+REMINDER_HOURS_BEFORE = 2
 
-FILES = {
-    'cards': 'cards_data.json', 
-    'colls': 'collections_data.json', 
-    'users': 'users_stats.json',
-    'lineups': 'lineup_data.json'
-}
+FIXED_COACH_ID = 7908057052  # ID тренера
 
-# Настройка очков за звезды
-STATS = {
-    1: {"score": 1000},
-    2: {"score": 2000},
-    3: {"score": 4000},
-    4: {"score": 6000},
-    5: {"score": 10000}
-}
+PROFILE_NAME = 0
+MATCH_DATE, MATCH_TIME, MATCH_LOCATION = range(3)
 
-# Список позиций для состава
-POSITIONS = ["КФ", "ПВ", "ЛВ", "ЦП", "ПЗ", "ЛЗ", "ГК"]
+POSITIONS = [
+    "Вратарь",
+    "Правый Защитник",
+    "Левый Защитник",
+    "Полузащитник",
+    "Правый Вингер",
+    "Центральный Нападающий",
+    "Левый Вингер"
+]
 
-# Словарь для хранения времени последнего получения карты
-last_roll = {}
-
-# --- [2] ФУНКЦИИ РАБОТЫ С БАЗОЙ ДАННЫХ ---
-
-def load_db(key):
-    """Загрузка данных из JSON файла"""
-    if not os.path.exists(FILES[key]):
-        # Если файла нет, создаем пустой объект или список
-        if key == 'cards':
-            res = []
-        else:
-            res = {}
-        save_db(res, key)
-        return res
-    
-    with open(FILES[key], 'r', encoding='utf-8') as f:
-        try:
+# ==================== РАБОТА С ДАННЫМИ ====================
+def load_data() -> dict:
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-        except:
-            return [] if key == 'cards' else {}
+    except FileNotFoundError:
+        return {"players": {}, "team": {"players": [], "coach": None}, "matches": []}
 
-def save_db(data, key):
-    """Сохранение данных в JSON файл"""
-    with open(FILES[key], 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+def save_data(data: dict):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def get_stars(count):
-    """Преобразование числа в строку со звездами"""
-    try:
-        return "⭐" * int(count)
-    except:
-        return "⭐"
+def is_coach(user_id: int, data: dict) -> bool:
+    if FIXED_COACH_ID is not None:
+        return user_id == FIXED_COACH_ID
+    return data["team"]["coach"] == user_id
 
-# --- [3] КЛАВИАТУРЫ ---
+def get_team_display(data: dict) -> str:
+    team = data["team"]["players"]
+    players = data["players"]
+    if not team:
+        return "Состав команды пуст."
+    lines = []
+    for idx, uid in enumerate(team, 1):
+        p = players.get(str(uid), {})
+        name = p.get("name", "Неизвестный")
+        pos = p.get("position", "?")
+        lines.append(f"{idx}. {name} – {pos}")
+    return "🧑‍🤝‍🧑 Текущий состав:\n" + "\n".join(lines)
 
-def main_kb(user):
-    """Главное меню бота"""
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    # Кнопка без значка, как ты просил
-    markup.row("Получить карту", "🗂 Коллекция")
-    markup.row("🏟 Мой состав", "🏆 Топ игроков")
-    markup.row("👤 Профиль", "💎 Премиум")
-    
-    # Проверка на админа для отображения панели
-    if user.username and user.username.lower() in [a.lower() for a in ADMINS]:
-        markup.add("🛠 Админ-панель")
-    return markup
+def get_future_matches(data: dict) -> List[dict]:
+    now = datetime.now()
+    future = [m for m in data["matches"] if datetime.fromisoformat(m["datetime"]) > now]
+    future.sort(key=lambda m: m["datetime"])
+    return future
 
-def lineup_kb(uid):
-    """Клавиатура для управления составом"""
-    lineups = load_db('lineups')
-    user_lineup = lineups.get(str(uid), {})
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    
-    for pos in POSITIONS:
-        # Если позиция занята — пишем имя игрока, если нет — "Пусто"
-        player_name = user_lineup.get(pos, "Пусто")
-        markup.add(types.InlineKeyboardButton(
-            text=f"{pos}: {player_name}", 
-            callback_data=f"setpos_{pos}"
-        ))
-    return markup
-
-# --- [4] ОСНОВНАЯ ЛОГИКА ---
-
-@bot.message_handler(commands=['start'])
-def start_cmd(m):
-    uid = str(m.from_user.id)
-    users = load_db('users')
-    
-    if uid not in users:
-        users[uid] = {
-            "score": 0, 
-            "username": m.from_user.username or f"user_{uid}"
-        }
-        save_db(users, 'users')
-    
-    bot.send_message(
-        m.chat.id, 
-        "👋 Привет! Это бот СЛС карточек.\nИспользуй кнопки ниже или напиши 'Получить карту' в группе.", 
-        reply_markup=main_kb(m.from_user)
+def format_match(match: dict) -> str:
+    dt = datetime.fromisoformat(match["datetime"]).strftime("%d.%m.%Y %H:%M")
+    return (
+        f"📅 {dt}\n"
+        f"📍 {match['location']}"
     )
 
-@bot.message_handler(func=lambda m: m.text == "Получить карту")
-def roll_card(m):
-    uid = str(m.from_user.id)
-    username = m.from_user.username or ""
-    is_admin = username.lower() in [a.lower() for a in ADMINS]
+def find_player_by_name(data: dict, name: str) -> Optional[str]:
+    for uid, p in data["players"].items():
+        if p.get("name") == name:
+            return uid
+    return None
 
-    # Проверка КД (Админы игнорируют задержку)
-    if not is_admin:
-        now = time.time()
-        if uid in last_roll:
-            elapsed = now - last_roll[uid]
-            if elapsed < COOLDOWN_TIME:
-                remains = int(COOLDOWN_TIME - elapsed)
-                mins = remains // 60
-                secs = remains % 60
-                return bot.send_message(
-                    m.chat.id, 
-                    f"⏳ Нужно подождать еще **{mins} мин. {secs} сек.**", 
-                    parse_mode="Markdown"
-                )
-        last_roll[uid] = now
-
-    cards = load_db('cards')
-    users = load_db('users')
-    colls = load_db('colls')
-
-    if not cards:
-        return bot.send_message(m.chat.id, "❌ В базе еще нет карточек! Добавь их через админку.")
-
-    # Выбираем случайную карту
-    won_card = random.choice(cards)
-    
-    if uid not in colls:
-        colls[uid] = []
-    
-    # Проверка на новую карту в коллекции
-    is_new = not any(c['name'] == won_card['name'] for c in colls[uid])
-    
-    # Начисление очков
-    stars_count = int(won_card.get('stars', 1))
-    base_points = STATS.get(stars_count, {"score": 500})["score"]
-    
-    # За повторку даем 30% очков
-    final_points = base_points if is_new else int(base_points * 0.3)
-    
-    if uid not in users:
-        users[uid] = {"score": 0, "username": username}
-    
-    users[uid]['score'] += int(final_points)
-    
-    if is_new:
-        colls[uid].append(won_card)
-        save_db(colls, 'colls')
-    
-    save_db(users, 'users')
-
-    status_text = "🆕 Новая карта!" if is_new else "♻️ Повторка"
-    
-    caption = (
-        f"⚽️ **{won_card['name']}** ({status_text})\n"
-        f" — — — — — — — — — —\n"
-        f"🎯 Позиция: `{won_card.get('pos', '—')}`\n"
-        f"📊 Рейтинг: {get_stars(won_card.get('stars', 1))}\n"
-        f" — — — — — — — — — —\n"
-        f"💠 Очки: `+{int(final_points):,}` | Всего: `{users[uid]['score']:,}`"
+# ==================== КОМАНДЫ ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "⚽️ Бот мини-футбольной команды\n\n"
+        "Доступные команды:\n"
+        "/profile — создать/посмотреть профиль (для Telegram-пользователей)\n"
+        "/team — состав команды\n"
+        "/add_player @user — добавить игрока с Telegram-аккаунтом (тренер)\n"
+        "/add_player Имя Позиция — добавить игрока вручную (тренер)\n"
+        "/match — создать матч\n"
+        "/matches — список будущих матчей\n"
+        "/setcoach @ник — назначить тренера (тренер)\n"
+        "/setplayer @name/Имя Позиция — назначить/изменить позицию (тренер)\n\n"
+        f"Позиции: {', '.join(POSITIONS)}\n"
+        "Тренер зафиксирован. Сначала создайте профиль через /profile, если вы играете."
     )
+    await update.message.reply_text(help_text)
 
-    try:
-        bot.send_photo(m.chat.id, won_card['photo'], caption=caption, parse_mode="Markdown")
-    except Exception as e:
-        bot.send_message(m.chat.id, f"⚠️ Ошибка фото: {e}\n\n{caption}", parse_mode="Markdown")
+# -------------------- ПРОФИЛЬ --------------------
+async def profile_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    user_id = update.effective_user.id
+    if str(user_id) in data["players"]:
+        p = data["players"][str(user_id)]
+        text = (
+            f"Ваш профиль:\n"
+            f"Имя: {p['name']}\n"
+            f"Позиция: {p.get('position', 'не назначена тренером')}\n"
+            f"Контакт: @{p['contact']}"
+        )
+        await update.message.reply_text(text)
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text("Введите ваше имя / ник:")
+        return PROFILE_NAME
 
-# --- ФУНКЦИИ ТОПА И ПРОФИЛЯ ---
-
-@bot.message_handler(func=lambda m: m.text == "🏆 Топ игроков")
-def show_top(m):
-    users = load_db('users')
-    
-    # Сортировка по очкам (score)
-    # x[1] — это данные пользователя, .get('score', 0) — вытягиваем очки
-    sorted_list = sorted(users.items(), key=lambda x: x[1].get('score', 0), reverse=True)
-    
-    top_text = "🏆 **ТОП-10 ИГРОКОВ ПО ОЧКАМ:**\n\n"
-    
-    for i, (uid, data) in enumerate(sorted_list[:10], 1):
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        user_display = data.get('username', f"ID:{uid}")
-        user_score = data.get('score', 0)
-        top_text += f"{medal} @{user_display} — `{user_score:,}` очков\n"
-    
-    bot.send_message(m.chat.id, top_text, parse_mode="Markdown")
-
-@bot.message_handler(func=lambda m: m.text == "👤 Профиль")
-def show_profile(m):
-    uid = str(m.from_user.id)
-    users = load_db('users')
-    colls = load_db('colls')
-    
-    u_data = users.get(uid, {"score": 0, "username": "Неизвестно"})
-    u_cards = len(colls.get(uid, []))
-    
-    profile_text = (
-        f"👤 **ВАШ ПРОФИЛЬ**\n"
-        f" — — — — — — — —\n"
-        f"🆔 ID: `{uid}`\n"
-        f"💠 Очки: `{u_data['score']:,}`\n"
-        f"🗂 Карт в коллекции: `{u_cards}`\n"
-        f" — — — — — — — —"
-    )
-    bot.send_message(m.chat.id, profile_text, parse_mode="Markdown")
-
-@bot.message_handler(func=lambda m: m.text == "🗂 Коллекция")
-def show_collection(m):
-    uid = str(m.from_user.id)
-    colls = load_db('colls')
-    my_cards = colls.get(uid, [])
-    
-    if not my_cards:
-        return bot.send_message(m.chat.id, "🗂 Твоя коллекция пока пуста. Получи свою первую карту!")
-    
-    # Группируем список имен
-    names = [f"• {c['name']} ({get_stars(c['stars'])})" for c in my_cards]
-    full_list = "\n".join(names)
-    
-    # Если список слишком длинный, Telegram может выдать ошибку, поэтому ограничим
-    if len(full_list) > 4000:
-        full_list = full_list[:4000] + "\n...и другие"
-
-    bot.send_message(m.chat.id, f"🗂 **ТВОЯ КОЛЛЕКЦИЯ ({len(my_cards)} шт.):**\n\n{full_list}", parse_mode="Markdown")
-
-# --- [5] МОЙ СОСТАВ (7 ПОЗИЦИЙ) ---
-
-@bot.message_handler(func=lambda m: m.text == "🏟 Мой состав")
-def show_lineup(m):
-    bot.send_message(
-        m.chat.id, 
-        "🏟 **Управление составом**\nНажми на позицию, чтобы поставить туда игрока из твоей коллекции.",
-        reply_markup=lineup_kb(m.from_user.id)
-    )
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("setpos_"))
-def handle_set_position(call):
-    pos = call.data.split("_")[1]
-    uid = str(call.from_user.id)
-    colls = load_db('colls')
-    my_cards = colls.get(uid, [])
-    
-    if not my_cards:
-        return bot.answer_callback_query(call.id, "❌ У тебя нет игроков в коллекции!", show_alert=True)
-    
-    # Создаем кнопки с именами игроков из коллекции
-    markup = types.InlineKeyboardMarkup()
-    for card in my_cards:
-        markup.add(types.InlineKeyboardButton(
-            text=f"{card['name']} ({card.get('pos', '—')})", 
-            callback_data=f"savepos_{pos}_{card['name']}"
-        ))
-    
-    # Кнопка отмены
-    markup.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_lineup"))
-    
-    bot.edit_message_text(
-        text=f"Выбери игрока на позицию **{pos}**:",
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=markup,
-        parse_mode="Markdown"
-    )
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("savepos_"))
-def handle_save_position(call):
-    # Данные приходят в формате savepos_ПОЗИЦИЯ_ИМЯ
-    data = call.data.split("_")
-    pos = data[1]
-    player_name = data[2]
-    uid = str(call.from_user.id)
-    
-    lineups = load_db('lineups')
-    
-    if uid not in lineups:
-        lineups[uid] = {}
-    
-    # Сохраняем игрока на позицию
-    lineups[uid][pos] = player_name
-    save_db(lineups, 'lineups')
-    
-    bot.answer_callback_query(call.id, f"✅ {player_name} поставлен на {pos}")
-    
-    # Возвращаемся в меню состава
-    bot.edit_message_text(
-        text="🏟 **Состав обновлен!**",
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=lineup_kb(uid)
-    )
-
-@bot.callback_query_handler(func=lambda c: c.data == "back_to_lineup")
-def handle_back_lineup(call):
-    bot.edit_message_text(
-        text="🏟 **Управление составом**",
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=lineup_kb(call.from_user.id)
-    )
-
-# --- [6] АДМИН-ПАНЕЛЬ ---
-
-@bot.message_handler(func=lambda m: m.text == "🛠 Админ-панель")
-def admin_panel(m):
-    username = m.from_user.username or ""
-    if username.lower() in [a.lower() for a in ADMINS]:
-        markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-        markup.row("➕ Добавить карту", "🗑 Удалить карту")
-        markup.row("🏠 Назад в меню")
-        bot.send_message(m.chat.id, "🛠 Режим администратора включен:", reply_markup=markup)
-
-@bot.message_handler(func=lambda m: m.text == "➕ Добавить карту")
-def admin_add_name(m):
-    username = m.from_user.username or ""
-    if username.lower() in [a.lower() for a in ADMINS]:
-        msg = bot.send_message(m.chat.id, "1. Введите ИМЯ игрока:")
-        bot.register_next_step_handler(msg, admin_add_stars)
-
-def admin_add_stars(m):
-    player_name = m.text
-    msg = bot.send_message(m.chat.id, f"2. Введите РЕЙТИНГ (число от 1 до 5) для {player_name}:")
-    bot.register_next_step_handler(msg, admin_add_pos, player_name)
-
-def admin_add_pos(m, player_name):
-    stars = m.text
-    msg = bot.send_message(m.chat.id, f"3. Введите ПОЗИЦИЮ (напр. ГК, КФ) для {player_name}:")
-    bot.register_next_step_handler(msg, admin_add_photo, player_name, stars)
-
-def admin_add_photo(m, player_name, stars):
-    pos = m.text
-    msg = bot.send_message(m.chat.id, f"4. Отправьте ФОТО для игрока {player_name}:")
-    bot.register_next_step_handler(msg, admin_add_final, player_name, stars, pos)
-
-def admin_add_final(m, player_name, stars, pos):
-    if not m.photo:
-        return bot.send_message(m.chat.id, "❌ Это не фото! Попробуй снова через меню.")
-    
-    cards = load_db('cards')
-    new_card = {
-        "name": player_name,
-        "stars": int(stars) if stars.isdigit() else 1,
-        "pos": pos,
-        "photo": m.photo[-1].file_id
+async def profile_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    user = update.effective_user
+    data = load_data()
+    data["players"][str(user.id)] = {
+        "name": name,
+        "position": None,
+        "contact": user.username or f"id{user.id}"
     }
-    cards.append(new_card)
-    save_db(cards, 'cards')
-    
-    bot.send_message(m.chat.id, f"✅ Игрок {player_name} успешно добавлен!", reply_markup=main_kb(m.from_user))
+    save_data(data)
+    await update.message.reply_text(
+        "✅ Профиль сохранён!\nПозицию назначит тренер командой /setplayer @username или /setplayer ВашеИмя Позиция",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return ConversationHandler.END
 
-@bot.message_handler(func=lambda m: m.text == "🗑 Удалить карту")
-def admin_delete_list(m):
-    username = m.from_user.username or ""
-    if username.lower() in [a.lower() for a in ADMINS]:
-        cards = load_db('cards')
-        if not cards:
-            return bot.send_message(m.chat.id, "База пуста.")
-        
-        markup = types.InlineKeyboardMarkup()
-        for c in cards:
-            markup.add(types.InlineKeyboardButton(text=f"❌ {c['name']}", callback_data=f"delcard_{c['name']}"))
-        
-        bot.send_message(m.chat.id, "Нажми на карту, чтобы удалить её из базы:", reply_markup=markup)
+async def profile_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Создание профиля отменено.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("delcard_"))
-def handle_delete_card(call):
-    name = call.data.split("_")[1]
-    cards = load_db('cards')
-    
-    new_cards = [c for c in cards if c['name'] != name]
-    save_db(new_cards, 'cards')
-    
-    bot.edit_message_text(f"✅ Карта {name} удалена из системы.", call.message.chat.id, call.message.message_id)
+# -------------------- ДОБАВЛЕНИЕ ИГРОКА --------------------
+async def add_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    data = load_data()
+    if not is_coach(user_id, data):
+        await update.message.reply_text("❌ Только тренер может добавлять игроков.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n"
+            "/add_player @user – добавить игрока с Telegram\n"
+            "/add_player Имя Позиция – добавить игрока вручную\n"
+            f"Допустимые позиции: {', '.join(POSITIONS)}\n"
+            "Пример: /add_player @ivan или /add_player Хонор Полузащитник"
+        )
+        return
+    # Первый вход
+    if not data["team"]["players"]:
+        if FIXED_COACH_ID is not None and user_id != FIXED_COACH_ID:
+            await update.message.reply_text("❌ Только зафиксированный тренер может создать команду.")
+            return
+        if str(user_id) not in data["players"]:
+            await update.message.reply_text("Сначала создайте профиль через /profile")
+            return
+        data["team"]["players"].append(user_id)
+        if FIXED_COACH_ID is not None:
+            data["team"]["coach"] = FIXED_COACH_ID
+        else:
+            data["team"]["coach"] = user_id
+        save_data(data)
+        await update.message.reply_text("✅ Вы добавлены в команду и стали тренером! 🧑‍🏫")
+        return
+    # Обычное добавление
+    first_arg = context.args[0]
+    if first_arg.startswith("@"):
+        username = first_arg.lstrip("@")
+        target_id = None
+        for uid, p in data["players"].items():
+            if p.get("contact") == username:
+                target_id = int(uid)
+                break
+        if target_id is None:
+            await update.message.reply_text(f"Игрок @{username} не найден. Сначала он должен создать профиль через /profile.")
+            return
+        if len(data["team"]["players"]) >= MAX_PLAYERS:
+            await update.message.reply_text(f"Команда уже укомплектована (максимум {MAX_PLAYERS} игроков).")
+            return
+        if target_id in data["team"]["players"]:
+            await update.message.reply_text("Этот игрок уже в команде.")
+            return
+        data["team"]["players"].append(target_id)
+        save_data(data)
+        await update.message.reply_text(f"Игрок @{username} добавлен в команду!")
+    else:
+        if len(context.args) < 2:
+            await update.message.reply_text("Укажите имя и позицию: /add_player Имя Позиция")
+            return
+        name = context.args[0]
+        pos_input = " ".join(context.args[1:])
+        if pos_input not in POSITIONS:
+            await update.message.reply_text(f"Неверная позиция. Допустимые: {', '.join(POSITIONS)}")
+            return
+        if len(data["team"]["players"]) >= MAX_PLAYERS:
+            await update.message.reply_text(f"Команда уже укомплектована (максимум {MAX_PLAYERS} игроков).")
+            return
+        new_id = f"manual_{uuid.uuid4().hex[:8]}"
+        data["players"][new_id] = {
+            "name": name,
+            "position": pos_input,
+            "contact": None
+        }
+        data["team"]["players"].append(new_id)
+        save_data(data)
+        await update.message.reply_text(f"✅ Игрок «{name}» ({pos_input}) добавлен в команду вручную.")
 
-@bot.message_handler(func=lambda m: m.text == "🏠 Назад в меню")
-def back_to_main(m):
-    bot.send_message(m.chat.id, "Возвращаемся в меню...", reply_markup=main_kb(m.from_user))
+# -------------------- НАЗНАЧЕНИЕ ПОЗИЦИИ --------------------
+async def setplayer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    data = load_data()
+    if not is_coach(user_id, data):
+        await update.message.reply_text("❌ Только тренер может назначать позицию.")
+        return
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование:\n"
+            "/setplayer @username Позиция – для игрока с Telegram\n"
+            "/setplayer Имя Позиция – для игрока, добавленного вручную\n"
+            f"Допустимые позиции: {', '.join(POSITIONS)}\n"
+            "Пример: /setplayer @ivan Правый Защитник или /setplayer Алексей Левый Вингер"
+        )
+        return
+    identifier = context.args[0]
+    pos_input = " ".join(context.args[1:])
+    if pos_input not in POSITIONS:
+        await update.message.reply_text(f"Неверная позиция. Допустимые: {', '.join(POSITIONS)}")
+        return
+    target_uid = None
+    if identifier.startswith("@"):
+        username = identifier.lstrip("@")
+        for uid, p in data["players"].items():
+            if p.get("contact") == username:
+                target_uid = uid
+                break
+    else:
+        target_uid = find_player_by_name(data, identifier)
+    if target_uid is None:
+        await update.message.reply_text(f"Игрок «{identifier}» не найден.")
+        return
+    data["players"][target_uid]["position"] = pos_input
+    save_data(data)
+    await update.message.reply_text(f"✅ Игроку {identifier} назначена позиция «{pos_input}».")
 
-@bot.message_handler(func=lambda m: m.text == "💎 Премиум")
-def show_premium(m):
-    bot.send_message(
-        m.chat.id, 
-        "💎 **Премиум статус**\n\n• Получение карт без КД\n• Уникальная роль в топе\n\n✉️ По вопросам покупки: @verybigsun", 
-        parse_mode="Markdown"
+# -------------------- СОСТАВ --------------------
+async def team(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    text = get_team_display(data)
+    coach_id = FIXED_COACH_ID or data["team"]["coach"]
+    if coach_id:
+        coach_info = data["players"].get(str(coach_id), {})
+        coach_name = coach_info.get("name", "Неизвестный")
+        text += f"\n\n🧑‍🏫 Тренер: {coach_name}"
+    await update.message.reply_text(text)
+
+# -------------------- МАТЧ (создание) --------------------
+async def match_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Введите дату матча в формате ДД.ММ.ГГГГ:")
+    return MATCH_DATE
+
+async def match_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    date_str = update.message.text.strip()
+    try:
+        datetime.strptime(date_str, "%d.%m.%Y")
+    except ValueError:
+        await update.message.reply_text("Неверный формат. Используйте ДД.ММ.ГГГГ")
+        return MATCH_DATE
+    context.user_data["match_date"] = date_str
+    await update.message.reply_text("Введите время матча в формате ЧЧ:ММ:")
+    return MATCH_TIME
+
+async def match_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    time_str = update.message.text.strip()
+    try:
+        datetime.strptime(time_str, "%H:%M")
+    except ValueError:
+        await update.message.reply_text("Неверный формат времени. Используйте ЧЧ:ММ")
+        return MATCH_TIME
+    context.user_data["match_time"] = time_str
+    await update.message.reply_text("Введите место проведения матча:")
+    return MATCH_LOCATION
+
+async def match_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    location = update.message.text.strip()
+    date_str = context.user_data["match_date"]
+    time_str = context.user_data["match_time"]
+    dt_str = f"{date_str} {time_str}"
+    dt = datetime.strptime(dt_str, "%d.%m.%Y %H:%M")
+    data = load_data()
+    match = {
+        "datetime": dt.isoformat(),
+        "location": location,
+        "participants": {}  # больше не используется, но оставим для совместимости
+    }
+    data["matches"].append(match)
+    save_data(data)
+    await update.message.reply_text(
+        f"✅ Матч создан!\n"
+        f"📅 {date_str} в {time_str}\n"
+        f"📍 {location}\n\n"
+        f"Список матчей: /matches"
+    )
+    return ConversationHandler.END
+
+async def match_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Создание матча отменено.")
+    return ConversationHandler.END
+
+# -------------------- СПИСОК МАТЧЕЙ (без участников) --------------------
+async def matches_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    future = get_future_matches(data)
+    if not future:
+        await update.message.reply_text("Нет предстоящих матчей.")
+        return
+    lines = ["📋 **Предстоящие матчи:**"]
+    for idx, match in enumerate(future, 1):
+        lines.append(f"\n{idx}. {format_match(match)}")
+    await update.message.reply_text("\n".join(lines))
+
+# -------------------- НАЗНАЧЕНИЕ ТРЕНЕРА --------------------
+async def setcoach(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    data = load_data()
+    if FIXED_COACH_ID is not None:
+        await update.message.reply_text("❌ Тренер зафиксирован и не может быть изменён.")
+        return
+    if not is_coach(user_id, data):
+        await update.message.reply_text("❌ Только тренер может передать полномочия.")
+        return
+    if not context.args:
+        await update.message.reply_text("Укажите @username нового тренера: /setcoach @user")
+        return
+    username = context.args[0].lstrip("@")
+    target_id = None
+    for uid, p in data["players"].items():
+        if p.get("contact") == username:
+            target_id = int(uid)
+            break
+    if target_id is None or target_id not in data["team"]["players"]:
+        await update.message.reply_text("Игрок не найден или не состоит в команде.")
+        return
+    data["team"]["coach"] = target_id
+    save_data(data)
+    await update.message.reply_text(f"🧑‍🏫 Тренер теперь @{username}")
+
+# ==================== УВЕДОМЛЕНИЯ (только для тренера) ====================
+async def check_matches_callback(context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    now = datetime.now()
+    for match in data["matches"]:
+        dt = datetime.fromisoformat(match["datetime"])
+        if dt > now:
+            if now + timedelta(hours=REMINDER_HOURS_BEFORE) >= dt > now:
+                coach_id = FIXED_COACH_ID or data["team"]["coach"]
+                if coach_id:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=coach_id,
+                            text=f"⏰ Напоминание: матч через {REMINDER_HOURS_BEFORE} ч.!\n{format_match(match)}"
+                        )
+                    except Exception as e:
+                        logging.warning(f"Не удалось отправить напоминание тренеру: {e}")
+
+# ==================== MAIN ====================
+def main():
+    logging.basicConfig(level=logging.INFO)
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    profile_handler = ConversationHandler(
+        entry_points=[CommandHandler("profile", profile_start)],
+        states={
+            PROFILE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, profile_name)],
+        },
+        fallbacks=[CommandHandler("cancel", profile_cancel)],
     )
 
-# --- [7] ЗАПУСК ---
+    match_handler = ConversationHandler(
+        entry_points=[CommandHandler("match", match_start)],
+        states={
+            MATCH_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, match_date)],
+            MATCH_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, match_time)],
+            MATCH_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, match_location)],
+        },
+        fallbacks=[CommandHandler("cancel", match_cancel)],
+    )
 
-if __name__ == '__main__':
-    print("Бот запущен. Ожидание сообщений...")
-    bot.infinity_polling()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(profile_handler)
+    app.add_handler(match_handler)
+    app.add_handler(CommandHandler("team", team))
+    app.add_handler(CommandHandler("add_player", add_player))
+    app.add_handler(CommandHandler("matches", matches_list))
+    app.add_handler(CommandHandler("setcoach", setcoach))
+    app.add_handler(CommandHandler("setplayer", setplayer))
+
+    # Уведомления только тренеру о предстоящем матче
+    job_queue = app.job_queue
+    job_queue.run_repeating(check_matches_callback, interval=600, first=10)
+
+    print("🚀 Бот запущен...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
